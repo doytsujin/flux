@@ -1053,6 +1053,7 @@ func (p *parser) parseParenIdentExpression(lparen token.Pos, key *ast.Identifier
 
 func (p *parser) parsePropertyList() []*ast.Property {
 	var params []*ast.Property
+	perrs := make([]ast.Error, 0)
 	for p.more() {
 		var param *ast.Property
 		switch _, tok, _ := p.peek(); tok {
@@ -1061,48 +1062,120 @@ func (p *parser) parsePropertyList() []*ast.Property {
 		case token.STRING:
 			param = p.parseStringProperty()
 		default:
-			// TODO(jsternberg): BadExpression.
-			p.consume()
-			continue
+			param = p.parseInvalidProperty()
 		}
 		params = append(params, param)
-		if _, tok, _ := p.peek(); tok == token.COMMA {
-			p.consume()
+
+		if p.more() {
+			if _, tok, lit := p.peek(); tok != token.COMMA {
+				perrs = append(perrs, ast.Error{
+					Msg: fmt.Sprintf("expected comma in property list, got %s (%q)", tok, lit),
+				})
+			} else {
+				p.consume()
+			}
 		}
 	}
+	p.errs = append(p.errs, perrs...)
 	return params
 }
 
 func (p *parser) parseStringProperty() *ast.Property {
 	key := p.parseStringLiteral()
 	p.expect(token.COLON)
-	val := p.parseExpression()
+	val := p.parsePropertyValue()
+	var endPos ast.Position
+	if val != nil {
+		endPos = locEnd(val)
+	} else {
+		endPos = locEnd(key)
+	}
 	return &ast.Property{
 		Key:   key,
 		Value: val,
 		BaseNode: p.baseNode(p.sourceLocation(
 			locStart(key),
-			locEnd(val),
+			endPos,
 		)),
 	}
 }
 
 func (p *parser) parseIdentProperty() *ast.Property {
+	property := &ast.Property{}
+	var startPos, endPos ast.Position
+
 	key := p.parseIdentifier()
-	loc := key.Location()
-	property := &ast.Property{
-		Key:      key,
-		BaseNode: p.baseNode(&loc),
-	}
+	property.Key = key
+	startPos = locStart(key)
+	endPos = locEnd(key)
+
 	if _, tok, _ := p.peek(); tok == token.COLON {
 		p.consume()
-		property.Value = p.parseExpression()
-		property.Loc = p.sourceLocation(
-			locStart(key),
-			locEnd(property.Value),
-		)
+		val := p.parsePropertyValue()
+		if val != nil {
+			property.Value = val
+			endPos = locEnd(val)
+		}
 	}
+	property.BaseNode = p.baseNode(p.sourceLocation(startPos, endPos))
 	return property
+}
+
+func (p *parser) parseInvalidProperty() *ast.Property {
+	prop := &ast.Property{}
+	var perrs []ast.Error
+	startPos, tok, lit := p.peek()
+	switch tok {
+	case token.COLON:
+		perrs = append(perrs, ast.Error{
+			Msg: "missing property key",
+		})
+		p.consume()
+		prop.Value = p.parsePropertyValue()
+	case token.COMMA:
+		perrs = append(perrs, ast.Error{
+			Msg: "missing property in property list",
+		})
+	default:
+		perrs = append(perrs, ast.Error{
+			Msg: fmt.Sprintf("unexpected token for property key: %s (%q)", tok, lit),
+		})
+
+		// We are not really parsing an expression, this is just a way to advance to
+		// to just before the next comma, colon, end of block, or EOF.
+		p.parseExpressionWhile(func() bool {
+			if _, tok, _ := p.peek(); tok == token.COMMA || tok == token.COLON {
+				return false
+			}
+			return p.more()
+		})
+
+		// If we stopped at a colon, attempt to parse the value
+		if _, tok, _ := p.peek(); tok == token.COLON {
+			p.consume()
+			prop.Value = p.parsePropertyValue()
+		}
+	}
+	endPos, _, _ := p.peek()
+	p.errs = append(p.errs, perrs...)
+	prop.BaseNode = p.position(startPos, endPos)
+	return prop
+}
+
+func (p *parser) parsePropertyValue() ast.Expression {
+	e := p.parseExpressionWhile(func() bool {
+		if _, tok, _ := p.peek(); tok == token.COMMA || tok == token.COLON {
+			return false
+		}
+		return p.more()
+	})
+	if e == nil {
+		// TODO: return a BadExpression here.  It would help simplify logic.
+		p.errs = append(p.errs, ast.Error{
+			Msg: "missing property value",
+		})
+	}
+	return e
 }
 
 func (p *parser) parseParameterList() []*ast.Property {
